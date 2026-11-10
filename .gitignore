@@ -1,0 +1,28 @@
+# Binari e file di grandi dimensioni
+*.ipa
+ig448.ipa
+*.dylib
+*.framework
+Payload/
+
+# Build artifacts
+build/
+DerivedData/
+.build/
+*.o
+*.a
+
+# Xcode files (generati da XcodeGen)
+*.xcodeproj
+*.xcworkspace
+xcuserdata/
+*.xcuserdatad
+
+# macOS
+.DS_Store
+.Spotlight-V100
+.Trashes
+
+# Varie
+*.swp
+*~
