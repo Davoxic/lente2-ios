@@ -21,7 +21,8 @@ public final class ProfileViewModel: ObservableObject {
 
         do {
             let cookies = SessionManager.shared.cookieHeader
-            let result = try await InstagramAPI.shared.fetchProfile(username: username, cookieHeader: cookies)
+            let csrf = SessionManager.shared.csrfToken
+            let result = try await InstagramAPI.shared.fetchProfile(username: username, cookieHeader: cookies, csrfToken: csrf)
             self.user = result.user
             self.posts = result.posts
             self.isLoading = false

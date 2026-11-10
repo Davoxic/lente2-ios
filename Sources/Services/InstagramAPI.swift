@@ -12,20 +12,20 @@ public enum InstagramAPIError: LocalizedError {
     public var errorDescription: String? {
         switch self {
         case .invalidURL:
-            return "URL richiesta non valido."
+            return "URL della richiesta non valido."
         case .notLoggedIn:
-            return "È necessario effettuare il login con Instagram per visualizzare questo contenuto."
+            return "Instagram richiede l'accesso al tuo account per effettuare ricerche. Fai tap su 'Accedi' in alto."
         case .networkError(let msg):
             return "Errore di connessione: \(msg)"
         case .invalidResponse(let code):
             if code == 401 || code == 403 {
-                return "Sessione Instagram scaduta o non autorizzata (Codice \(code)). Prova a rieseguire il login."
+                return "Sessione scaduta o accesso non autorizzato (Codice \(code)). Effettua nuovamente il login."
             } else if code == 429 {
-                return "Instagram sta limitando temporaneamente le richieste (Rate Limit 429). Attendi qualche secondo."
+                return "Instagram sta limitando temporaneamente le richieste (Rate Limit 429). Attendi qualche istante."
             }
-            return "Risposta non valida dal server Instagram (Codice \(code))."
+            return "Risposta del server Instagram non valida (Codice \(code))."
         case .userNotFound:
-            return "Utente non trovato o inesistente."
+            return "Profilo non trovato o inesistente."
         case .privateAccount:
             return "Questo profilo è privato. Solo i follower approvati possono visualizzarne i post."
         case .decodingError(let msg):
@@ -37,25 +37,30 @@ public enum InstagramAPIError: LocalizedError {
 public final class InstagramAPI {
     public static let shared = InstagramAPI()
 
-    private let defaultUserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1"
+    private let defaultUserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1"
     private let igAppID = "936619743392459"
     private let session: URLSession
 
     private init() {
         let config = URLSessionConfiguration.default
-        config.timeoutIntervalForRequest = 20
-        config.timeoutIntervalForResource = 30
+        config.timeoutIntervalForRequest = 25
+        config.timeoutIntervalForResource = 35
         self.session = URLSession(configuration: config)
     }
 
-    private func makeRequest(url: URL, cookieHeader: String) -> URLRequest {
+    private func makeRequest(url: URL, cookieHeader: String, csrfToken: String? = nil) -> URLRequest {
         var req = URLRequest(url: url)
         req.setValue(defaultUserAgent, forHTTPHeaderField: "User-Agent")
         req.setValue(igAppID, forHTTPHeaderField: "X-IG-App-ID")
         req.setValue("XMLHttpRequest", forHTTPHeaderField: "X-Requested-With")
         req.setValue("https://www.instagram.com/", forHTTPHeaderField: "Referer")
         req.setValue("https://www.instagram.com", forHTTPHeaderField: "Origin")
-        req.setValue("application/json", forHTTPHeaderField: "Accept")
+        req.setValue("application/json, text/plain, */*", forHTTPHeaderField: "Accept")
+        req.setValue("it-IT,it;q=0.9,en-US;q=0.8,en;q=0.7", forHTTPHeaderField: "Accept-Language")
+
+        if let csrf = csrfToken, !csrf.isEmpty {
+            req.setValue(csrf, forHTTPHeaderField: "X-CSRFToken")
+        }
         if !cookieHeader.isEmpty {
             req.setValue(cookieHeader, forHTTPHeaderField: "Cookie")
         }
@@ -63,17 +68,32 @@ public final class InstagramAPI {
     }
 
     // MARK: - Search
-    public func searchUsers(query: String, cookieHeader: String) async throws -> [InstagramUserMini] {
-        guard let encoded = query.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
-              let url = URL(string: "https://www.instagram.com/api/v1/web/search/topsearch/?query=\(encoded)") else {
+    public func searchUsers(query: String, cookieHeader: String, csrfToken: String? = nil) async throws -> [InstagramUserMini] {
+        let cleanQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
+            .trimmingCharacters(in: CharacterSet(charactersIn: "@"))
+
+        guard !cleanQuery.isEmpty else { return [] }
+
+        guard !cookieHeader.isEmpty else {
+            throw InstagramAPIError.notLoggedIn
+        }
+
+        guard let encoded = cleanQuery.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
+              let url = URL(string: "https://www.instagram.com/api/v1/web/search/topsearch/?context=blended&query=\(encoded)&include_reel=false&search_surface=web_top_search") else {
             throw InstagramAPIError.invalidURL
         }
 
-        let req = makeRequest(url: url, cookieHeader: cookieHeader)
+        let req = makeRequest(url: url, cookieHeader: cookieHeader, csrfToken: csrfToken)
         let (data, response) = try await session.data(for: req)
 
-        if let http = response as? HTTPURLResponse, http.statusCode != 200 {
-            throw InstagramAPIError.invalidResponse(http.statusCode)
+        if let http = response as? HTTPURLResponse {
+            if http.statusCode == 401 || http.statusCode == 403 {
+                throw InstagramAPIError.notLoggedIn
+            } else if http.statusCode == 429 {
+                throw InstagramAPIError.invalidResponse(429)
+            } else if http.statusCode != 200 {
+                throw InstagramAPIError.invalidResponse(http.statusCode)
+            }
         }
 
         do {
@@ -86,7 +106,7 @@ public final class InstagramAPI {
             for item in usersArray {
                 guard let u = item["user"] as? [String: Any],
                       let username = u["username"] as? String else { continue }
-                
+
                 let pk = "\(u["pk"] ?? u["id"] ?? UUID().uuidString)"
                 let fullName = u["full_name"] as? String ?? ""
                 let picStr = u["profile_pic_url"] as? String
@@ -110,18 +130,24 @@ public final class InstagramAPI {
     }
 
     // MARK: - Profile & Posts
-    public func fetchProfile(username: String, cookieHeader: String) async throws -> (user: InstagramUser, posts: [InstagramPost]) {
-        guard let encoded = username.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed),
+    public func fetchProfile(username: String, cookieHeader: String, csrfToken: String? = nil) async throws -> (user: InstagramUser, posts: [InstagramPost]) {
+        let cleanUsername = username.trimmingCharacters(in: .whitespacesAndNewlines)
+            .trimmingCharacters(in: CharacterSet(charactersIn: "@"))
+
+        guard !cleanUsername.isEmpty,
+              let encoded = cleanUsername.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed),
               let url = URL(string: "https://www.instagram.com/api/v1/users/web_profile_info/?username=\(encoded)") else {
             throw InstagramAPIError.invalidURL
         }
 
-        let req = makeRequest(url: url, cookieHeader: cookieHeader)
+        let req = makeRequest(url: url, cookieHeader: cookieHeader, csrfToken: csrfToken)
         let (data, response) = try await session.data(for: req)
 
         if let http = response as? HTTPURLResponse {
             if http.statusCode == 404 {
                 throw InstagramAPIError.userNotFound
+            } else if http.statusCode == 401 || http.statusCode == 403 {
+                throw InstagramAPIError.notLoggedIn
             } else if http.statusCode != 200 {
                 throw InstagramAPIError.invalidResponse(http.statusCode)
             }
@@ -134,19 +160,19 @@ public final class InstagramAPI {
         }
 
         let id = "\(userDict["id"] ?? "")"
-        let uname = userDict["username"] as? String ?? username
+        let uname = userDict["username"] as? String ?? cleanUsername
         let fullName = userDict["full_name"] as? String ?? ""
         let bio = userDict["biography"] as? String ?? ""
         let isVerified = userDict["is_verified"] as? Bool ?? false
         let isPrivate = userDict["is_private"] as? Bool ?? false
-        
+
         let picURL = (userDict["profile_pic_url"] as? String).flatMap { URL(string: $0) }
         let picURLHD = (userDict["profile_pic_url_hd"] as? String).flatMap { URL(string: $0) }
         let extURL = (userDict["external_url"] as? String).flatMap { URL(string: $0) }
 
         let followersCount = (userDict["edge_followed_by"] as? [String: Any])?["count"] as? Int ?? 0
         let followingCount = (userDict["edge_follow"] as? [String: Any])?["count"] as? Int ?? 0
-        
+
         let timelineMedia = userDict["edge_owner_to_timeline_media"] as? [String: Any]
         let postsCount = timelineMedia?["count"] as? Int ?? 0
 
@@ -208,7 +234,6 @@ public final class InstagramAPI {
         var mediaItems: [MediaItem] = []
         var mediaType: MediaType = isVideo ? .video : .image
 
-        // Carosello multi-media
         if let sidecar = node["edge_sidecar_to_children"] as? [String: Any],
            let children = sidecar["edges"] as? [[String: Any]], !children.isEmpty {
             mediaType = .carousel

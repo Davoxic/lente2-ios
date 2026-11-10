@@ -15,13 +15,21 @@ public final class SearchViewModel: ObservableObject {
         loadRecents()
     }
 
+    public var cleanQuery: String {
+        searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+            .trimmingCharacters(in: CharacterSet(charactersIn: "@"))
+    }
+
     public func onSearchTextChanged(to query: String) {
         searchTask?.cancel()
 
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+            .trimmingCharacters(in: CharacterSet(charactersIn: "@"))
+
         guard !trimmed.isEmpty else {
             searchResults = []
             isSearching = false
+            errorMessage = nil
             return
         }
 
@@ -34,7 +42,8 @@ public final class SearchViewModel: ObservableObject {
 
             do {
                 let cookies = SessionManager.shared.cookieHeader
-                let users = try await InstagramAPI.shared.searchUsers(query: trimmed, cookieHeader: cookies)
+                let csrf = SessionManager.shared.csrfToken
+                let users = try await InstagramAPI.shared.searchUsers(query: trimmed, cookieHeader: cookies, csrfToken: csrf)
                 if !Task.isCancelled {
                     self.searchResults = users
                     self.isSearching = false
@@ -90,18 +99,21 @@ public struct SearchView: View {
 
     public var body: some View {
         NavigationStack {
-            Group {
-                if !sessionManager.isLoggedIn && viewModel.searchResults.isEmpty && viewModel.recentSearches.isEmpty && viewModel.searchText.isEmpty {
-                    notLoggedInHero
-                } else if viewModel.isSearching && viewModel.searchResults.isEmpty {
-                    ProgressView("Ricerca in corso...")
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
-                } else if !viewModel.searchResults.isEmpty {
-                    searchResultsList
-                } else if !viewModel.searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    emptySearchResults
-                } else {
-                    recentsView
+            VStack(spacing: 0) {
+                // Barra di avviso se non loggato
+                if !sessionManager.isLoggedIn {
+                    notLoggedInBanner
+                }
+
+                Group {
+                    if viewModel.isSearching && viewModel.searchResults.isEmpty {
+                        ProgressView("Ricerca in corso...")
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    } else if !viewModel.cleanQuery.isEmpty {
+                        queryResultsView
+                    } else {
+                        recentsView
+                    }
                 }
             }
             .navigationTitle("Cerca")
@@ -119,7 +131,7 @@ public struct SearchView: View {
                         Button("Accedi") {
                             showLoginSheet = true
                         }
-                        .fontWeight(.semibold)
+                        .fontWeight(.bold)
                     }
                 }
             }
@@ -129,74 +141,111 @@ public struct SearchView: View {
         }
     }
 
-    private var notLoggedInHero: some View {
-        VStack(spacing: 20) {
-            Image(systemName: "magnifyingglass.circle.fill")
-                .font(.system(size: 64))
-                .foregroundColor(.accentColor)
+    // MARK: - Banner Non Connesso
+    private var notLoggedInBanner: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundColor(.orange)
+                .font(.title3)
 
-            Text("Ricerca Diretta Instagram")
-                .font(.title2)
-                .fontWeight(.bold)
-
-            Text("Cerca qualsiasi profilo, visualizza i contenuti in alta definizione e salva o fai il regram dei post senza doomscrolling.")
-                .font(.subheadline)
-                .foregroundColor(.secondary)
-                .multilineTextAlignment(.center)
-                .padding(.horizontal, 32)
-
-            Button(action: { showLoginSheet = true }) {
-                HStack {
-                    Image(systemName: "person.crop.circle.badge.plus")
-                    Text("Accedi con Instagram")
-                        .fontWeight(.semibold)
-                }
-                .foregroundColor(.white)
-                .frame(maxWidth: .infinity)
-                .padding(.vertical, 14)
-                .background(Color.accentColor, in: RoundedRectangle(cornerRadius: 12))
-                .padding(.horizontal, 32)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Accesso Instagram richiesto")
+                    .font(.footnote)
+                    .fontWeight(.bold)
+                Text("Per cercare e visualizzare i profili, esegui il login.")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
             }
 
-            Text("L'accesso avviene tramite WebView sicuro. Nessun dato lascia il tuo iPhone.")
-                .font(.caption2)
-                .foregroundColor(.secondary)
-                .padding(.horizontal, 40)
-                .multilineTextAlignment(.center)
+            Spacer()
+
+            Button("Accedi") {
+                showLoginSheet = true
+            }
+            .font(.footnote)
+            .fontWeight(.semibold)
+            .buttonStyle(.borderedProminent)
+            .controlSize(.small)
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .background(Color(.secondarySystemBackground))
     }
 
-    private var searchResultsList: some View {
+    // MARK: - Risultati Query
+    private var queryResultsView: some View {
         List {
-            ForEach(viewModel.searchResults) { user in
-                NavigationLink(destination: ProfileView(username: user.username)) {
-                    UserRowView(user: user)
+            // Tasto rapido sempre visibile: Apri direttamente il profilo digitato
+            Section {
+                NavigationLink(destination: ProfileView(username: viewModel.cleanQuery)) {
+                    HStack(spacing: 12) {
+                        Image(systemName: "arrow.right.circle.fill")
+                            .font(.title3)
+                            .foregroundColor(.accentColor)
+
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Apri profilo @\(viewModel.cleanQuery)")
+                                .font(.body)
+                                .fontWeight(.bold)
+                                .foregroundColor(.primary)
+
+                            Text("Visualizza direttamente post, foto e regram")
+                                .font(.caption2)
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                    .padding(.vertical, 4)
                 }
-                .simultaneousGesture(TapGesture().onEnded {
-                    viewModel.addToRecents(user: user)
-                })
+            } header: {
+                Text("Accesso Diretto")
+            }
+
+            // Mostra eventuale errore di rete/sessione
+            if let error = viewModel.errorMessage {
+                Section {
+                    VStack(alignment: .leading, spacing: 6) {
+                        HStack {
+                            Image(systemName: "info.circle.fill")
+                                .foregroundColor(.orange)
+                            Text("Stato ricerca")
+                                .font(.footnote)
+                                .fontWeight(.bold)
+                        }
+                        Text(error)
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+
+                        if !sessionManager.isLoggedIn {
+                            Button("Esegui il Login con Instagram") {
+                                showLoginSheet = true
+                            }
+                            .font(.caption)
+                            .fontWeight(.semibold)
+                            .padding(.top, 4)
+                        }
+                    }
+                    .padding(.vertical, 6)
+                }
+            }
+
+            // Risultati Suggeriti
+            if !viewModel.searchResults.isEmpty {
+                Section(header: Text("Profili Trovati")) {
+                    ForEach(viewModel.searchResults) { user in
+                        NavigationLink(destination: ProfileView(username: user.username)) {
+                            UserRowView(user: user)
+                        }
+                        .simultaneousGesture(TapGesture().onEnded {
+                            viewModel.addToRecents(user: user)
+                        })
+                    }
+                }
             }
         }
         .listStyle(.insetGrouped)
     }
 
-    private var emptySearchResults: some View {
-        VStack(spacing: 12) {
-            Image(systemName: "person.slash")
-                .font(.system(size: 40))
-                .foregroundColor(.secondary)
-
-            Text("Nessun profilo trovato")
-                .font(.headline)
-
-            Text("Prova a verificare l'esatta ortografia dello username.")
-                .font(.subheadline)
-                .foregroundColor(.secondary)
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-    }
-
+    // MARK: - Recenti & Schermata Iniziale
     private var recentsView: some View {
         List {
             if !viewModel.recentSearches.isEmpty {
@@ -221,7 +270,7 @@ public struct SearchView: View {
                     }
                 } header: {
                     HStack {
-                        Text("Recenti")
+                        Text("Ricerche Recenti")
                         Spacer()
                         Button("Cancella tutto") {
                             viewModel.clearRecents()
@@ -231,15 +280,15 @@ public struct SearchView: View {
                     }
                 }
             } else {
-                VStack(spacing: 12) {
+                VStack(spacing: 16) {
                     Image(systemName: "magnifyingglass")
-                        .font(.system(size: 36))
+                        .font(.system(size: 44))
                         .foregroundColor(.secondary)
 
                     Text("Cerca un profilo")
                         .font(.headline)
 
-                    Text("Digita uno username nella barra in alto per esplorare profili e media.")
+                    Text("Digita qualsiasi @username nella barra in alto per cercare profili o aprirli direttamente.")
                         .font(.subheadline)
                         .foregroundColor(.secondary)
                         .multilineTextAlignment(.center)
